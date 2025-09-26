@@ -12,6 +12,7 @@ import torch
 import numpy as np
 from pathlib import Path
 import yaml
+import json
 from tqdm import tqdm
 import time
 
@@ -91,6 +92,209 @@ class LaneATTInference:
         
         return img_tensor.to(self.device)
     
+    def filter_duplicate_lanes(self, lanes, min_distance=150):
+        """
+        Filter out duplicate/overlapping lanes based on spatial distance
+        
+        Args:
+            lanes: List of detected lanes
+            min_distance: Minimum pixel distance between lane centers
+            
+        Returns:
+            Filtered list of lanes
+        """
+        if len(lanes) <= 1:
+            return lanes
+        
+        # Calculate lane center positions
+        lane_centers = []
+        for lane in lanes:
+            points = lane.points
+            if len(points) > 0:
+                # Calculate average x position across all points
+                avg_x = np.mean(points[:, 0])
+                lane_centers.append(avg_x)
+            else:
+                lane_centers.append(0)
+        
+        # Sort lanes by confidence (highest first)
+        lane_conf_pairs = [(i, lanes[i].metadata.get('conf', 0)) for i in range(len(lanes))]
+        lane_conf_pairs.sort(key=lambda x: x[1], reverse=True)
+        
+        # Filter duplicates
+        filtered_indices = []
+        for i, conf in lane_conf_pairs:
+            current_center = lane_centers[i]
+            
+            # Check if this lane is too close to any already selected lane
+            is_duplicate = False
+            for j in filtered_indices:
+                existing_center = lane_centers[j]
+                distance = abs(current_center - existing_center)
+                
+                # Convert normalized distance to pixels for comparison
+                if distance < (min_distance / 1280):  # Assuming 1280 pixel width
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                filtered_indices.append(i)
+        
+        # Return filtered lanes sorted by position (left to right)
+        filtered_lanes = [lanes[i] for i in filtered_indices]
+        filtered_lanes.sort(key=lambda lane: np.mean(lane.points[:, 0]))
+        
+        return filtered_lanes
+        
+    def smart_lane_selection(self, input_lanes, target_count=3):
+        """
+        Intelligently select lanes to better cover the road width
+        
+        Args:
+            lanes: List of detected lanes
+            target_count: Target number of lanes to return
+            
+        Returns:
+            Selected lanes with better distribution
+        """
+        if len(input_lanes) <= target_count:
+            return input_lanes
+        
+        # Calculate lane positions and confidence
+        lane_info = []
+        for i, lane in enumerate(input_lanes):
+            points = lane.points
+            if len(points) > 0:
+                x_center = np.mean(points[:, 0])
+                x_min = np.min(points[:, 0])
+                x_max = np.max(points[:, 0])
+                conf = lane.metadata.get('conf', 0)
+                lane_info.append({
+                    'index': i,
+                    'center': x_center,
+                    'min': x_min, 
+                    'max': x_max,
+                    'conf': conf,
+                    'lane': lane
+                })
+        
+        if len(lane_info) == 0:
+            return input_lanes
+        
+        # Sort by position (left to right)
+        lane_info.sort(key=lambda x: x['center'])
+        
+        # Select lanes with better distribution
+        selected = []
+        
+        # Always take the highest confidence lane
+        best_conf_lane = max(lane_info, key=lambda x: x['conf'])
+        selected.append(best_conf_lane)
+        
+        # Try to find lanes that are sufficiently different
+        for candidate in lane_info:
+            if candidate in selected:
+                continue
+                
+            # Check distance from already selected lanes
+            too_close = False
+            for selected_lane in selected:
+                distance = abs(candidate['center'] - selected_lane['center'])
+                if distance < 0.15:  # Minimum 15% of image width separation
+                    too_close = True
+                    break
+            
+            if not too_close:
+                selected.append(candidate)
+                if len(selected) >= target_count:
+                    break
+        
+        # If we need more lanes and have space, add the next best by confidence
+        while len(selected) < target_count and len(selected) < len(lane_info):
+            remaining = [l for l in lane_info if l not in selected]
+            if remaining:
+                best_remaining = max(remaining, key=lambda x: x['conf'])
+                selected.append(best_remaining)
+        
+        # Return the lanes sorted by position
+        selected.sort(key=lambda x: x['center'])
+        return [item['lane'] for item in selected]
+    
+    def export_lane_info(self, lanes, image_path, original_size, format='json'):
+        """
+        Export lane information to JSON or YAML format
+        
+        Args:
+            lanes: List of detected lanes
+            image_path: Path to source image
+            original_size: (width, height) of original image
+            format: 'json' or 'yaml'
+            
+        Returns:
+            Dictionary containing lane information
+        """
+        lane_data = {
+            'image_info': {
+                'path': str(image_path),
+                'width': original_size[0],
+                'height': original_size[1],
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            },
+            'detection_info': {
+                'total_lanes': len(lanes),
+                'model_input_size': [self.img_w, self.img_h],
+                'confidence_threshold': self.test_params.get('conf_threshold', 0.5),
+                'nms_threshold': self.test_params.get('nms_thres', 50.0)
+            },
+            'lanes': []
+        }
+        
+        for i, lane in enumerate(lanes):
+            points = lane.points
+            confidence = lane.metadata.get('conf', 0)
+            start_x = lane.metadata.get('start_x', 0)
+            start_y = lane.metadata.get('start_y', 0)
+            
+            # Convert normalized coordinates to pixel coordinates
+            pixel_points = []
+            for point in points:
+                x_pixel = int(point[0] * original_size[0])
+                y_pixel = int(point[1] * original_size[1])
+                pixel_points.append([x_pixel, y_pixel])
+            
+            # Calculate lane statistics
+            x_coords = points[:, 0]
+            y_coords = points[:, 1]
+            
+            lane_info = {
+                'lane_id': i + 1,
+                'confidence': float(confidence),
+                'total_points': len(points),
+                'coordinates': {
+                    'normalized': points.tolist(),  # Normalized [0,1] coordinates
+                    'pixel': pixel_points           # Pixel coordinates
+                },
+                'statistics': {
+                    'x_range_normalized': [float(x_coords.min()), float(x_coords.max())],
+                    'y_range_normalized': [float(y_coords.min()), float(y_coords.max())],
+                    'x_range_pixel': [int(x_coords.min() * original_size[0]), int(x_coords.max() * original_size[0])],
+                    'y_range_pixel': [int(y_coords.min() * original_size[1]), int(y_coords.max() * original_size[1])],
+                    'center_x_normalized': float(np.mean(x_coords)),
+                    'center_y_normalized': float(np.mean(y_coords)),
+                    'center_x_pixel': int(np.mean(x_coords) * original_size[0]),
+                    'center_y_pixel': int(np.mean(y_coords) * original_size[1]),
+                    'length_pixels': len(points)
+                },
+                'metadata': {
+                    'start_x': float(start_x),
+                    'start_y': float(start_y)
+                }
+            }
+            
+            lane_data['lanes'].append(lane_info)
+        
+        return lane_data
+    
     def draw_lanes_on_image(self, image, lanes, thickness=3):
         """
         Draw detected lanes on image
@@ -153,7 +357,7 @@ class LaneATTInference:
         
         return result_img
     
-    def infer_image(self, image_path, save_path=None, show_result=True):
+    def infer_image(self, image_path, save_path=None, show_result=True, export_format=None):
         """
         Run inference on a single image
         
@@ -161,6 +365,7 @@ class LaneATTInference:
             image_path: Path to input image
             save_path: Path to save result (optional)
             show_result: Whether to display result
+            export_format: Export lane data format ('json', 'yaml', 'both', or None)
             
         Returns:
             Detected lanes and result image
@@ -184,6 +389,10 @@ class LaneATTInference:
             predictions = self.model(img_tensor, **self.test_params)
             lanes = self.model.decode(predictions, as_lanes=True)[0]
         
+        # Filter duplicate lanes and apply smart selection
+        filtered_lanes = self.filter_duplicate_lanes(lanes, min_distance=150)  # Increased from 40 to 150
+        lanes = self.smart_lane_selection(filtered_lanes, target_count=2)  # Reduced from 3 to 2
+        
         inference_time = time.time() - start_time
         print(f"Inference time: {inference_time:.4f}s")
         print(f"Detected {len(lanes)} lanes")
@@ -201,6 +410,25 @@ class LaneATTInference:
         if save_path:
             cv2.imwrite(str(save_path), result_img)
             print(f"Result saved to: {save_path}")
+            
+            # Export lane information if requested
+            if export_format in ['json', 'yaml', 'both']:
+                base_path = Path(save_path)
+                
+                # Export lane data
+                lane_data = self.export_lane_info(lanes, image_path, (original_w, original_h))
+                
+                if export_format in ['json', 'both']:
+                    json_path = base_path.with_suffix('.json')
+                    with open(json_path, 'w') as f:
+                        json.dump(lane_data, f, indent=2)
+                    print(f"Lane data (JSON) saved to: {json_path}")
+                
+                if export_format in ['yaml', 'both']:
+                    yaml_path = base_path.with_suffix('.yaml')
+                    with open(yaml_path, 'w') as f:
+                        yaml.dump(lane_data, f, default_flow_style=False, indent=2)
+                    print(f"Lane data (YAML) saved to: {yaml_path}")
         
         # Show result
         if show_result:
@@ -210,7 +438,7 @@ class LaneATTInference:
         
         return lanes, result_img
     
-    def infer_video(self, video_path, output_path=None, show_result=True, skip_frames=0):
+    def infer_video(self, video_path, output_path=None, show_result=True, skip_frames=0, export_format=None):
         """
         Run inference on video
         
@@ -219,6 +447,7 @@ class LaneATTInference:
             output_path: Path to save output video (optional)
             show_result: Whether to display results
             skip_frames: Number of frames to skip between processing
+            export_format: Export lane data format ('json', 'yaml', 'both', or None)
         """
         print(f"Processing video: {video_path}")
         
@@ -266,6 +495,10 @@ class LaneATTInference:
                         predictions = self.model(img_tensor, **self.test_params)
                         lanes = self.model.decode(predictions, as_lanes=True)[0]
                     
+                    # Filter duplicate lanes and apply smart selection
+                    filtered_lanes = self.filter_duplicate_lanes(lanes, min_distance=150)  # Increased filtering
+                    lanes = self.smart_lane_selection(filtered_lanes, target_count=2)  # Reduced target lanes
+                    
                     # Draw results
                     result_frame = self.draw_lanes_on_image(frame, lanes)
                     
@@ -301,6 +534,41 @@ class LaneATTInference:
         print(f"Processed {processed_count} frames")
         if output_path:
             print(f"Output video saved to: {output_path}")
+            
+            # Export lane information for the last frame if requested
+            if export_format in ['json', 'yaml', 'both'] and processed_count > 0:
+                print("Exporting sample lane data from last processed frame...")
+                # Re-read the last frame for lane data export
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
+                ret, last_frame = cap.read()
+                if ret:
+                    # Run inference on last frame
+                    img_tensor = self.preprocess_image(last_frame)
+                    with torch.no_grad():
+                        predictions = self.model(img_tensor, **self.test_params)
+                        lanes = self.model.decode(predictions, as_lanes=True)[0]
+                    
+                    # Filter lanes
+                    filtered_lanes = self.filter_duplicate_lanes(lanes, min_distance=150)
+                    lanes = self.smart_lane_selection(filtered_lanes, target_count=2)
+                    
+                    # Export lane data
+                    base_path = Path(output_path)
+                    sample_frame_name = f"{base_path.stem}_sample_frame"
+                    
+                    lane_data = self.export_lane_info(lanes, f"{video_path}_frame_{frame_count}", (width, height))
+                    
+                    if export_format in ['json', 'both']:
+                        json_path = base_path.parent / f"{sample_frame_name}.json"
+                        with open(json_path, 'w') as f:
+                            json.dump(lane_data, f, indent=2)
+                        print(f"Sample lane data (JSON) saved to: {json_path}")
+                    
+                    if export_format in ['yaml', 'both']:
+                        yaml_path = base_path.parent / f"{sample_frame_name}.yaml"
+                        with open(yaml_path, 'w') as f:
+                            yaml.dump(lane_data, f, default_flow_style=False, indent=2)
+                        print(f"Sample lane data (YAML) saved to: {yaml_path}")
 
 
 def main():

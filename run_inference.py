@@ -5,6 +5,7 @@ Simple usage script for LaneATT inference with your specific video files
 
 import os
 import sys
+import argparse
 from pathlib import Path
 
 # Add current directory to path
@@ -14,6 +15,19 @@ from inference import LaneATTInference
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='LaneATT Inference with lane data export')
+    parser.add_argument('--mode', choices=['video', 'image'], default='video', help='Processing mode')
+    parser.add_argument('--input', type=str, help='Input file path')
+    parser.add_argument('--output', type=str, help='Output file path')
+    parser.add_argument('--export_format', choices=['json', 'yaml', 'both'], default='both', help='Export format for lane data')
+    parser.add_argument('--skip_frames', type=int, default=0, help='Skip frames for faster processing')
+    args = parser.parse_args()
+    
+    # If arguments provided, use them directly
+    if args.input and args.output:
+        run_with_args(args)
+        return
     print("=== LaneATT Local Inference ===")
     print()
     
@@ -103,7 +117,8 @@ def main():
                 str(video_path),
                 str(output_path),
                 show_result=True,  # Set to False if you don't want to see the video playback
-                skip_frames=0  # Process every frame, set to 1 to process every other frame for speed
+                skip_frames=0,  # Process every frame, set to 1 to process every other frame for speed
+                export_format='both'  # Export lane data in both JSON and YAML
             )
             print(f"✅ Successfully processed: {name}")
             print(f"   Output saved to: {output_path}")
@@ -118,6 +133,50 @@ def main():
     print("- Press 'q' while video is playing to stop processing")
     print("- Output videos are saved in the same directory")
     print("- You can modify skip_frames parameter to process faster (skip frames)")
+
+
+def run_with_args(args):
+    """Run inference with command line arguments"""
+    base_dir = Path(__file__).parent
+    config_path = base_dir / "experiments" / "laneatt_r18_culane" / "config.yaml"
+    model_path = base_dir / "experiments" / "laneatt_r18_culane" / "models" / "model_0015.pt"
+    
+    print(f"=== LaneATT {args.mode.upper()} Inference ===")
+    print(f"Input: {args.input}")
+    print(f"Output: {args.output}")
+    print(f"Export format: {args.export_format}")
+    print()
+    
+    # Initialize inference
+    try:
+        inferencer = LaneATTInference(str(config_path), str(model_path), device='cuda')
+        print("✅ Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return
+    
+    try:
+        if args.mode == 'video':
+            inferencer.infer_video(
+                args.input,
+                args.output,
+                show_result=True,
+                skip_frames=args.skip_frames,
+                export_format=args.export_format
+            )
+        else:  # image mode
+            lanes, result_img = inferencer.infer_image(
+                args.input,
+                save_path=args.output,
+                show_result=True,
+                export_format=args.export_format
+            )
+            print(f"Detected {len(lanes)} lanes")
+        
+        print(f"✅ Processing complete! Output saved to: {args.output}")
+        
+    except Exception as e:
+        print(f"❌ Error during processing: {e}")
 
 
 if __name__ == '__main__':

@@ -56,7 +56,7 @@ def compute_lane_iou(lane1, lane2_array):
     """
     Compute IoU between one lane and an array of lanes
     
-    For lane detection, we use a simplified IoU based on x-coordinate overlap
+    For lane detection, we use a more aggressive IoU based on x-coordinate overlap
     at different y positions along the lane
     """
     if len(lane2_array.shape) == 1:
@@ -96,18 +96,21 @@ def compute_lane_iou(lane1, lane2_array):
         lane1_x_segment = lane1_xs[y_start:y_end]
         lane2_x_segment = lane2_xs[y_start:y_end]
         
-        # Simple IoU approximation based on x-coordinate similarity
+        # More aggressive similarity check for lane clustering
         x_diff = np.abs(lane1_x_segment - lane2_x_segment)
         
-        # Consider lanes similar if x-coordinates are close (within some threshold)
-        threshold = 50  # pixels
-        overlap_points = np.sum(x_diff < threshold)
-        union_points = len(lane1_x_segment)  # simplified union
+        # Consider lanes similar if average difference is small
+        avg_diff = np.mean(x_diff)
         
-        if union_points > 0:
-            ious[i] = overlap_points / union_points
+        # More aggressive thresholds to reduce lane clustering
+        if avg_diff < 30:  # Very similar lanes (reduced from 50)
+            ious[i] = 0.9  # High IoU to suppress
+        elif avg_diff < 60:  # Somewhat similar lanes 
+            ious[i] = 0.7  # Medium IoU
+        elif avg_diff < 100:  # Moderately similar lanes
+            ious[i] = 0.4  # Lower IoU
         else:
-            ious[i] = 0.0
+            ious[i] = 0.0  # Different lanes
     
     return ious
 
