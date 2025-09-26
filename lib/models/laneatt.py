@@ -6,7 +6,11 @@ import numpy as np
 import torch.nn as nn
 from torchvision.models import resnet18, resnet34
 
-from nms import nms
+try:
+    from nms import nms
+except ImportError:
+    # Fallback to CPU implementation if CUDA NMS is not available
+    from lib.nms_cpu import nms
 from lib.lane import Lane
 from lib.focal_loss import FocalLoss
 
@@ -320,7 +324,7 @@ class LaneATT(nn.Module):
             # if the proposal does not start at the bottom of the image,
             # extend its proposal until the x is outside the image
             mask = ~((((lane_xs[:start] >= 0.) &
-                       (lane_xs[:start] <= 1.)).cpu().numpy()[::-1].cumprod()[::-1]).astype(np.bool))
+                       (lane_xs[:start] <= 1.)).cpu().numpy()[::-1].cumprod()[::-1]).astype(bool))
             lane_xs[end + 1:] = -2
             lane_xs[:start][mask] = -2
             lane_ys = self.anchor_ys[lane_xs >= 0]
